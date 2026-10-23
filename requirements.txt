@@ -1,0 +1,62 @@
+# CV–Job Match — Python dependencies
+#
+# Tested against Python 3.10 and 3.11 (recommended for Streamlit Community Cloud).
+#
+# Model download sizes (one-time, on first run):
+#   GLiNER small-v2.1          ≈ 50 MB
+#   all-MiniLM-L6-v2           ≈ 90 MB
+#   Total                      ≈ 140 MB
+#
+# Expected first-run time:
+#   Streamlit Community Cloud  : 2–5 minutes (download + CPU warm-up)
+#   Local machine (GPU)        : 30–60 seconds after download
+#
+# Memory requirements:
+#   Peak RAM during scoring    : ≈ 800 MB – 1.2 GB
+#   Streamlit Community Cloud free tier provides 1 GB RAM;
+#   keep CV and JD under 15 000 characters each.
+#
+# ------------------------------------------------------------------
+# Core framework
+# ------------------------------------------------------------------
+streamlit>=1.35.0,<2.0.0
+
+# ------------------------------------------------------------------
+# GLiNER – zero-shot named-entity recognition
+# ------------------------------------------------------------------
+gliner>=0.2.7,<0.3.0
+
+# ------------------------------------------------------------------
+# Sentence-Transformers – semantic similarity
+# ------------------------------------------------------------------
+sentence-transformers>=3.0.0,<4.0.0
+
+# ------------------------------------------------------------------
+# PyTorch (CPU build – works on Streamlit Community Cloud and locally)
+# If you have a local NVIDIA GPU, replace this with the matching
+# CUDA wheel from https://pytorch.org/get-started/locally/
+# ------------------------------------------------------------------
+torch>=2.2.0,<3.0.0
+
+# ------------------------------------------------------------------
+# Hugging Face ecosystem (required by both models)
+# ------------------------------------------------------------------
+transformers>=4.40.0,<5.0.0
+huggingface-hub>=0.23.0,<1.0.0
+tokenizers>=0.19.0,<1.0.0
+
+# ------------------------------------------------------------------
+# Numerical computing (used by sentence-transformers internally)
+# ------------------------------------------------------------------
+numpy>=2.1.0,<3.0.0
+
+# ------------------------------------------------------------------
+# Data display (used in the evidence table in app.py)
+# ------------------------------------------------------------------
+pandas>=2.1.0,<3.0.0
+
+# ------------------------------------------------------------------
+# File reading
+# ------------------------------------------------------------------
+pdfplumber>=0.11.0,<1.0.0        # text-based PDF extraction
+python-docx>=1.1.0,<2.0.0        # DOCX extraction
