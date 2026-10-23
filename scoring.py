@@ -103,12 +103,20 @@ def classify_requirements(
 
 def _split_sentences(text: str) -> List[str]:
     """
-    Simple sentence splitter that works without NLTK.
-    Splits on '.', '!', '?' followed by whitespace or end-of-string.
-    Returns only non-empty sentences.
+    Split text into sentences, lines, and bullet points.
+    Works for standard prose as well as bulleted CV formats.
     """
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [s.strip() for s in sentences if s.strip()]
+    if not text or not text.strip():
+        return []
+    # Split on sentence terminators (. ! ?) followed by whitespace, or on newlines
+    raw_chunks = re.split(r'(?:(?<=[.!?])\s+|\r?\n+)', text.strip())
+    cleaned = []
+    for chunk in raw_chunks:
+        # Strip common bullet characters and extra whitespace
+        c = re.sub(r'^[•\-\*\u2022\u2023\u25E6\u2043\u2219]\s*', '', chunk.strip()).strip()
+        if c and len(c) > 1:
+            cleaned.append(c)
+    return cleaned if cleaned else [text.strip()]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -145,18 +153,23 @@ def score_cv_against_requirements(
     cv_sentences = _split_sentences(cv_text)
     # Safety guard: fall back to full CV as a single "sentence" if empty
     if not cv_sentences:
-        cv_sentences = [cv_text]
+        cv_sentences = [cv_text.strip()] if cv_text.strip() else [""]
 
     # Pre-encode all CV sentences once (expensive) rather than once per requirement
-    try:
-        cv_embeddings = st_model.encode(
-            cv_sentences,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-    except Exception:
-        cv_embeddings = None  # Embedding failed; we'll rely on direct-mention only
+    cv_embeddings = None
+    if st_model is not None and any(s.strip() for s in cv_sentences):
+        try:
+            valid_sentences = [s for s in cv_sentences if s.strip()]
+            if valid_sentences:
+                cv_embeddings = st_model.encode(
+                    valid_sentences,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                cv_sentences = valid_sentences
+        except Exception:
+            cv_embeddings = None  # Embedding failed; fallback to direct-mention only
 
     results: List[Dict[str, Any]] = []
 
@@ -187,14 +200,22 @@ def _score_single_requirement(
     """Score one requirement against the CV and return a result dict."""
 
     # ── Step 1: Direct mention ────────────────────────────────────────────────
-    # Use word-boundary-aware search so "java" doesn't match "javascript"
-    pattern = re.compile(r"\b" + re.escape(phrase.lower()) + r"\b", re.IGNORECASE)
+    phrase_clean = phrase.strip()
+    phrase_lower = phrase_clean.lower()
 
-    # Find the sentence(s) that contain this phrase
-    matching_sentences = [s for s in cv_sentences if pattern.search(s.lower())]
+    # Word-boundary check: handle symbols (e.g. c++, c#, .net) gracefully
+    prefix = r"\b" if re.match(r"^\w", phrase_lower) else r"(?:\s|\A)"
+    suffix = r"\b" if re.search(r"\w$", phrase_lower) else r"(?:\s|[.,;!?]|\Z)"
+    pattern = re.compile(prefix + re.escape(phrase_lower) + suffix, re.IGNORECASE)
+
+    # Find matching sentences
+    matching_sentences = [
+        s for s in cv_sentences
+        if pattern.search(s) or (len(phrase_lower) >= 3 and phrase_lower in s.lower())
+    ]
 
     if matching_sentences:
-        # Check the surrounding context (up to 3 sentences) for limitation words
+        # Check surrounding context (up to 3 sentences) for limitation words
         context = " ".join(matching_sentences[:3])
         if _LIMITATION_RE.search(context):
             return {
@@ -214,10 +235,10 @@ def _score_single_requirement(
             }
 
     # ── Step 2: Semantic fallback ─────────────────────────────────────────────
-    if cv_embeddings is not None:
+    if cv_embeddings is not None and st_model is not None:
         try:
             req_embedding = st_model.encode(
-                [phrase],
+                [phrase_clean],
                 normalize_embeddings=True,
                 show_progress_bar=False,
                 convert_to_numpy=True,
@@ -227,13 +248,14 @@ def _score_single_requirement(
             best_idx = int(np.argmax(similarities))
             best_sim = float(similarities[best_idx])
 
-            if best_sim >= threshold:
+            if np.isfinite(best_sim) and best_sim >= threshold:
+                evidence_text = cv_sentences[best_idx][:300] if best_idx < len(cv_sentences) else ""
                 return {
                     "requirement": phrase,
                     "priority": priority,
                     "status": "possible",
                     "credit": 0.5,
-                    "evidence": cv_sentences[best_idx][:300],
+                    "evidence": evidence_text,
                     "similarity": round(best_sim, 3),
                 }
         except Exception:
@@ -264,20 +286,17 @@ def compute_meaning_similarity(jd_text: str, cv_text: str, st_model) -> float:
       4. Return the average of those best-match scores.
 
     Returns a float in [0, 1].  Multiply by 100 to get a percentage.
-
-    Note: This score can be misleadingly high if the CV uses domain language
-    similar to the JD but for different purposes (e.g. "Java" vs "JavaScript").
     """
     jd_sentences = _split_sentences(jd_text)
     cv_sentences = _split_sentences(cv_text)
 
-    if not jd_sentences or not cv_sentences:
+    if not jd_sentences or not cv_sentences or st_model is None:
         return 0.0
 
     # Build overlapping JD windows (groups of 5 sentences)
     jd_windows = _build_windows(jd_sentences, window_size=5, step=3)
     if not jd_windows:
-        jd_windows = [jd_text]
+        jd_windows = [jd_text.strip()]
 
     try:
         jd_embeddings = st_model.encode(
@@ -292,14 +311,17 @@ def compute_meaning_similarity(jd_text: str, cv_text: str, st_model) -> float:
             show_progress_bar=False,
             convert_to_numpy=True,
         )
+
+        # For each JD window, find the best-matching CV sentence
+        similarity_matrix = np.dot(jd_embeddings, cv_embeddings.T)  # shape: (n_jd, n_cv)
+        best_per_jd = similarity_matrix.max(axis=1)                  # shape: (n_jd,)
+
+        score = float(np.mean(best_per_jd))
+        if np.isnan(score) or not np.isfinite(score):
+            return 0.0
+        return max(0.0, min(1.0, score))
     except Exception:
         return 0.0
-
-    # For each JD window, find the best-matching CV sentence
-    similarity_matrix = np.dot(jd_embeddings, cv_embeddings.T)  # shape: (n_jd, n_cv)
-    best_per_jd = similarity_matrix.max(axis=1)                  # shape: (n_jd,)
-
-    return float(np.mean(best_per_jd))
 
 
 def _build_windows(sentences: List[str], window_size: int, step: int) -> List[str]:
@@ -340,8 +362,8 @@ def compute_final_rating(
     total_weight = 0.0
 
     for row in score_rows:
-        w = weight_map.get(row["priority"], 1)
-        total_weighted_credit += row["credit"] * w
+        w = weight_map.get(row.get("priority", "desirable"), 1)
+        total_weighted_credit += float(row.get("credit", 0.0)) * w
         total_weight += w
 
     if total_weight == 0:
@@ -349,6 +371,17 @@ def compute_final_rating(
     else:
         coverage = 100.0 * total_weighted_credit / total_weight
 
-    final = 0.70 * coverage + 0.30 * (meaning_score * 100)
+    if np.isnan(meaning_score) or not np.isfinite(meaning_score):
+        meaning_score = 0.0
+
+    final = 0.70 * coverage + 0.30 * (meaning_score * 100.0)
+
+    if np.isnan(coverage) or not np.isfinite(coverage):
+        coverage = 0.0
+    if np.isnan(final) or not np.isfinite(final):
+        final = 0.0
+
+    coverage = max(0.0, min(100.0, coverage))
+    final = max(0.0, min(100.0, final))
 
     return round(coverage, 2), round(final, 2)

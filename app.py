@@ -1,17 +1,14 @@
 """
-CV–Job Match App  —  User-Friendly Edition
-===========================================
+CV–Job Match App  —  Full Width & User-Friendly Edition
+======================================================
 A step-by-step wizard that guides the user through:
 
-  STEP 1  →  Paste your Job Description + CV
+  STEP 1  →  Paste your Job Description + CV (or Upload file with auto-extract)
   STEP 2  →  Let AI find skill phrases  (one button click)
   STEP 3  →  Check / edit the requirement list
-  STEP 4  →  Get your match score + suggestions
+  STEP 4  →  Calculate match score + suggestions
 
-Design principle: each step only appears AFTER the previous one is complete,
-so the user always knows exactly what to do next.
-
-DISCLAIMERS (also shown in the app):
+DISCLAIMERS:
   • Scores measure text alignment only — NOT verified skills or hiring probability.
   • Scoring weights are unvalidated prototype values.
   • Uploaded text is processed in memory only — never stored or logged.
@@ -23,12 +20,13 @@ import streamlit as st
 st.set_page_config(
     page_title="CV–Job Match",
     page_icon="📄",
-    layout="centered",          # centred is friendlier for a wizard flow
+    layout="wide",  # Full width of screen
     initial_sidebar_state="collapsed",
 )
 
 import datetime
 import re
+import pandas as pd
 
 # ── Local modules ──────────────────────────────────────────────────────────────
 from models import load_gliner, load_sentence_transformer
@@ -46,17 +44,67 @@ from samples import SAMPLE_JD, SAMPLE_CV
 # ── Constants ──────────────────────────────────────────────────────────────────
 MAX_CHARS = 15_000   # roughly 2,500 words — safe for Streamlit free tier
 
+# ── Custom CSS for full-width polish ──────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    /* Full width container optimization */
+    .block-container {
+        padding-top: 1.8rem;
+        padding-bottom: 3rem;
+        padding-left: 2.5rem;
+        padding-right: 2.5rem;
+        max-width: 100% !important;
+    }
+    /* Breadcrumb badge styles */
+    .step-badge {
+        text-align: center;
+        padding: 8px 12px;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 0.95rem;
+    }
+    .step-badge-done {
+        background-color: #dcfce7;
+        color: #15803d;
+        border: 1px solid #86efac;
+    }
+    .step-badge-active {
+        background-color: #dbeafe;
+        color: #1d4ed8;
+        border: 2px solid #3b82f6;
+    }
+    .step-badge-pending {
+        background-color: #f3f4f6;
+        color: #6b7280;
+        border: 1px solid #e5e7eb;
+    }
+    /* Section containers */
+    .wizard-card {
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 20px;
+        border: 1px solid #e2e8f0;
+        margin-bottom: 20px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Small helper functions
+# Helper functions for state resets
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _reset_all() -> None:
     """Wipe everything downstream so stale results never show."""
     for key in [
-        "jd_text", "cv_text",
+        "jd_text", "cv_text", "jd_textarea", "cv_textarea",
+        "_last_uploaded_file_id", "cv_upload",
         "jd_phrases", "cv_phrases",
         "essential_reqs", "desirable_reqs",
+        "ess_edit", "des_edit",
         "score_rows", "coverage_score", "meaning_score", "final_rating",
         "last_extracted_jd", "last_extracted_cv",
     ]:
@@ -68,6 +116,7 @@ def _reset_from_extraction() -> None:
     for key in [
         "jd_phrases", "cv_phrases",
         "essential_reqs", "desirable_reqs",
+        "ess_edit", "des_edit",
         "score_rows", "coverage_score", "meaning_score", "final_rating",
         "last_extracted_jd", "last_extracted_cv",
     ]:
@@ -83,8 +132,10 @@ def _reset_scores_only() -> None:
 def _text_changed_since_extraction() -> bool:
     """Return True if the user edited JD or CV after the last extraction."""
     ss = st.session_state
-    jd_ok = ss.get("jd_text", "") == ss.get("last_extracted_jd")
-    cv_ok = ss.get("cv_text", "") == ss.get("last_extracted_cv")
+    if ss.get("last_extracted_jd") is None or ss.get("last_extracted_cv") is None:
+        return False
+    jd_ok = ss.get("jd_text", "").strip() == ss.get("last_extracted_jd", "").strip()
+    cv_ok = ss.get("cv_text", "").strip() == ss.get("last_extracted_cv", "").strip()
     return not (jd_ok and cv_ok)
 
 
@@ -92,7 +143,7 @@ def _check_length(text: str, label: str) -> bool:
     """Show an error and return False if text exceeds MAX_CHARS."""
     if len(text) > MAX_CHARS:
         st.error(
-            f"⚠️  Your {label} is too long ({len(text):,} characters). "
+            f"⚠️ Your {label} is too long ({len(text):,} characters). "
             f"Please use at most {MAX_CHARS:,} characters (~2,500 words) "
             "to keep memory use reasonable."
         )
@@ -105,19 +156,30 @@ def _check_length(text: str, label: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_progress(current_step: int) -> None:
-    """
-    Show a simple visual breadcrumb so the user always knows where they are.
-    current_step: 1, 2, 3, or 4
-    """
-    steps = ["📋 Add Documents", "🔍 Find Skills", "✏️ Edit Requirements", "📊 Get Score"]
-    cols = st.columns(4)
-    for i, (col, label) in enumerate(zip(cols, steps), start=1):
+    """Show visual breadcrumbs spanning the full width."""
+    steps = [
+        ("1. Add Documents", "📋"),
+        ("2. Find Skills", "🔍"),
+        ("3. Edit Requirements", "✏️"),
+        ("4. Calculate Score", "📊"),
+    ]
+    cols = st.columns(4, gap="medium")
+    for i, (col, (label, icon)) in enumerate(zip(cols, steps), start=1):
         if i < current_step:
-            col.markdown(f"<div style='text-align:center;color:#22c55e;font-weight:bold'>✅ {label}</div>", unsafe_allow_html=True)
+            col.markdown(
+                f"<div class='step-badge step-badge-done'>✅ {icon} {label}</div>",
+                unsafe_allow_html=True,
+            )
         elif i == current_step:
-            col.markdown(f"<div style='text-align:center;color:#3b82f6;font-weight:bold;border-bottom:3px solid #3b82f6;padding-bottom:4px'>▶ {label}</div>", unsafe_allow_html=True)
+            col.markdown(
+                f"<div class='step-badge step-badge-active'>▶️ {icon} {label}</div>",
+                unsafe_allow_html=True,
+            )
         else:
-            col.markdown(f"<div style='text-align:center;color:#9ca3af'>{label}</div>", unsafe_allow_html=True)
+            col.markdown(
+                f"<div class='step-badge step-badge-pending'>{icon} {label}</div>",
+                unsafe_allow_html=True,
+            )
     st.markdown("<br>", unsafe_allow_html=True)
 
 
@@ -128,29 +190,38 @@ def _render_progress(current_step: int) -> None:
 def render_step1() -> int:
     """
     Collect the Job Description and CV text.
-    Returns the current wizard step (1 if inputs missing, 2 if both present).
+    Handles upload with automatic text extraction into the text box below.
+    Returns 2 if both JD and CV are present, else 1.
     """
-    jd_text = st.session_state.get("jd_text", "")
-    cv_text = st.session_state.get("cv_text", "")
-
-    # ── Friendly intro ─────────────────────────────────────────────────────────
     st.markdown("### Step 1 — Add Your Documents")
     st.markdown(
-        "Paste (or load the sample) **Job Description** on the left and your "
-        "**CV** on the right. You can also upload a PDF, Word, or text file for your CV."
+        "Paste or load the **Job Description** on the left. On the right, **upload your CV** "
+        "(PDF, Word DOCX, or TXT) and its text will automatically extract into the box below."
     )
 
-    # ── Try the sample ─────────────────────────────────────────────────────────
-    with st.expander("🎯 New here? Try the built-in sample first!", expanded=(not jd_text and not cv_text)):
-        st.markdown(
-            "Click the button below to load a fictional **Data Analyst** job and CV. "
-            "This lets you see the full app flow without using your own documents."
-        )
-        if st.button("✨ Load sample Job Description + CV", key="btn_sample_both"):
-            st.session_state["jd_text"] = SAMPLE_JD
-            st.session_state["cv_text"] = SAMPLE_CV
-            _reset_from_extraction()
-            st.rerun()
+    # ── Sample Loaders Expander ────────────────────────────────────────────────
+    with st.expander("🎯 Need test data? Load built-in samples with one click", expanded=not bool(st.session_state.get("jd_text") and st.session_state.get("cv_text"))):
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            if st.button("✨ Load Both Sample JD + CV", key="btn_sample_both", use_container_width=True):
+                st.session_state["jd_text"] = SAMPLE_JD
+                st.session_state["jd_textarea"] = SAMPLE_JD
+                st.session_state["cv_text"] = SAMPLE_CV
+                st.session_state["cv_textarea"] = SAMPLE_CV
+                _reset_from_extraction()
+                st.rerun()
+        with col_s2:
+            if st.button("📋 Load Sample JD Only", key="btn_sample_jd", use_container_width=True):
+                st.session_state["jd_text"] = SAMPLE_JD
+                st.session_state["jd_textarea"] = SAMPLE_JD
+                _reset_from_extraction()
+                st.rerun()
+        with col_s3:
+            if st.button("📄 Load Sample CV Only", key="btn_sample_cv", use_container_width=True):
+                st.session_state["cv_text"] = SAMPLE_CV
+                st.session_state["cv_textarea"] = SAMPLE_CV
+                _reset_from_extraction()
+                st.rerun()
 
     st.markdown("---")
 
@@ -160,58 +231,71 @@ def render_step1() -> int:
     # ── Job Description ───────────────────────────────────────────────────────
     with col_jd:
         st.markdown("#### 📋 Job Description")
-        st.caption("Copy the full job posting and paste it here.")
+        st.caption("Paste the full job posting below.")
+
+        if "jd_text" not in st.session_state:
+            st.session_state["jd_text"] = ""
+        if "jd_textarea" not in st.session_state:
+            st.session_state["jd_textarea"] = st.session_state["jd_text"]
 
         jd_new = st.text_area(
             "Job Description text",
-            value=jd_text,
-            height=280,
+            value=st.session_state.get("jd_text", ""),
+            height=300,
             key="jd_textarea",
-            placeholder="Paste the job posting here…\n\nExample:\n  'We are looking for a Data Analyst with Python and SQL experience…'",
+            placeholder="Paste the job posting here…\n\nExample:\n  'We are looking for a Data Analyst proficient in Python, SQL, and data visualization with Tableau…'",
             label_visibility="collapsed",
         )
-        # Detect changes
-        if jd_new != jd_text:
+        if jd_new != st.session_state.get("jd_text", ""):
             st.session_state["jd_text"] = jd_new
             _reset_from_extraction()
 
-        # Character counter + hint
-        char_count = len(st.session_state.get("jd_text", ""))
-        if char_count > 0:
-            colour = "red" if char_count > MAX_CHARS else "green"
-            st.caption(f":{colour}[{char_count:,} / {MAX_CHARS:,} characters]")
+        char_count_jd = len(st.session_state.get("jd_text", ""))
+        if char_count_jd > 0:
+            colour = "red" if char_count_jd > MAX_CHARS else "green"
+            st.caption(f":{colour}[{char_count_jd:,} / {MAX_CHARS:,} characters]")
         else:
-            st.caption("No text yet.")
+            st.caption("No JD text yet.")
 
-    # ── CV ────────────────────────────────────────────────────────────────────
+    # ── CV / Résumé ───────────────────────────────────────────────────────────
     with col_cv:
         st.markdown("#### 📄 Your CV / Résumé")
-        st.caption("Upload a file **or** paste your CV text directly below.")
+        st.caption("Upload a file — text will be **automatically extracted** into the box below.")
+
+        if "cv_text" not in st.session_state:
+            st.session_state["cv_text"] = ""
+        if "cv_textarea" not in st.session_state:
+            st.session_state["cv_textarea"] = st.session_state["cv_text"]
 
         uploaded = st.file_uploader(
-            "Upload PDF, DOCX, or TXT",
+            "Upload PDF, DOCX, or TXT file",
             type=["pdf", "docx", "txt"],
             key="cv_upload",
             label_visibility="visible",
         )
 
+        # Automatic file extraction
         if uploaded is not None:
-            with st.spinner("Reading your file…"):
-                extracted, error = read_uploaded_file(uploaded)
-            if error:
-                st.error(f"❌ Could not read file — {error}")
-            else:
-                st.success("✅ File read! You can edit the text below if anything looks wrong.")
-                if extracted != st.session_state.get("cv_text", ""):
+            file_id = f"{uploaded.name}_{uploaded.size}"
+            if st.session_state.get("_last_uploaded_file_id") != file_id:
+                with st.spinner("📄 Automatically extracting text from uploaded file…"):
+                    extracted, error = read_uploaded_file(uploaded)
+                if error:
+                    st.error(f"❌ Could not read file: {error}")
+                else:
                     st.session_state["cv_text"] = extracted
+                    st.session_state["cv_textarea"] = extracted
+                    st.session_state["_last_uploaded_file_id"] = file_id
                     _reset_from_extraction()
+                    st.toast("✅ CV text extracted automatically into the box below!")
+                    st.rerun()
 
         cv_new = st.text_area(
             "CV text",
             value=st.session_state.get("cv_text", ""),
-            height=230,
+            height=240,
             key="cv_textarea",
-            placeholder="Paste your CV here…\n\nOr upload a file above — the text will appear here automatically.",
+            placeholder="Paste your CV here…\n\nOr upload a PDF/DOCX/TXT above — the text extracts automatically here.",
             label_visibility="collapsed",
         )
         if cv_new != st.session_state.get("cv_text", ""):
@@ -223,16 +307,15 @@ def render_step1() -> int:
             colour = "red" if char_count_cv > MAX_CHARS else "green"
             st.caption(f":{colour}[{char_count_cv:,} / {MAX_CHARS:,} characters]")
         else:
-            st.caption("No text yet.")
+            st.caption("No CV text yet.")
 
-    # ── Decide what step we are on ────────────────────────────────────────────
+    # ── Check completion ──────────────────────────────────────────────────────
     jd_ready = bool(st.session_state.get("jd_text", "").strip())
     cv_ready = bool(st.session_state.get("cv_text", "").strip())
 
-    st.markdown("")  # breathing room
-
+    st.markdown("")
     if jd_ready and cv_ready:
-        st.success("✅ Both documents added! Scroll down to **Step 2** to extract skill phrases.")
+        st.success("✅ Both documents ready! Scroll down to **Step 2** to find skill phrases.")
         return 2
     else:
         missing = []
@@ -251,26 +334,22 @@ def render_step1() -> int:
 def render_step2(gliner_model) -> int:
     """
     Run GLiNER on both documents and display the detected phrases.
-    Returns 3 if extraction succeeded, else 2.
+    Returns 3 if phrases are available, else 2.
     """
     st.markdown("### Step 2 — Find Skill Phrases")
     st.markdown(
-        "The AI (called **GLiNER**) will scan both documents and pull out "
-        "skill-related words and phrases — things like tools, technologies, "
-        "methods, and certifications."
+        "The zero-shot NER model (**GLiNER**) scans both documents and extracts "
+        "skill-related phrases (tools, programming languages, qualifications, certifications)."
     )
 
-    # Warn if text changed after a previous extraction
-    if (
-        st.session_state.get("last_extracted_jd") is not None
-        and _text_changed_since_extraction()
-    ):
+    # Stale text warning
+    if _text_changed_since_extraction():
         st.warning(
-            "⚠️  You edited your JD or CV after the last extraction. "
-            "Click **Find Skill Phrases** again to get fresh results."
+            "⚠️ You edited your JD or CV text after the last extraction. "
+            "Click **Find Skill Phrases** again to refresh the requirements."
         )
 
-    col_btn, col_note = st.columns([1, 3])
+    col_btn, col_note = st.columns([1, 4])
     with col_btn:
         extract_clicked = st.button(
             "🔍 Find Skill Phrases",
@@ -280,8 +359,7 @@ def render_step2(gliner_model) -> int:
         )
     with col_note:
         st.caption(
-            "This may take **20–60 seconds** on CPU. "
-            "The AI reads every sentence — please be patient."
+            "Reads every sentence using GLiNER. Typically takes 15–45 seconds on CPU."
         )
 
     if extract_clicked:
@@ -295,57 +373,55 @@ def render_step2(gliner_model) -> int:
             ok = False
 
         if ok:
-            with st.spinner("🤖 AI is reading your documents… (may take up to 60 s)"):
+            with st.spinner("🤖 AI is extracting skill phrases from your documents…"):
                 jd_phrases = extract_phrases(gliner_model, jd_text)
                 cv_phrases = extract_phrases(gliner_model, cv_text)
 
             if not jd_phrases:
                 st.warning(
-                    "⚠️  No skill phrases found in the Job Description. "
-                    "Try adding more detail, or load the sample JD to test the app."
+                    "⚠️ No skill phrases could be extracted from the Job Description. "
+                    "Try adding more specific requirements, or load the sample JD."
                 )
             else:
                 essential, desirable = classify_requirements(jd_phrases)
-                st.session_state.update({
-                    "jd_phrases": jd_phrases,
-                    "cv_phrases": cv_phrases,
-                    "essential_reqs": essential,
-                    "desirable_reqs": desirable,
-                    "last_extracted_jd": jd_text,
-                    "last_extracted_cv": cv_text,
-                })
+                st.session_state["jd_phrases"] = jd_phrases
+                st.session_state["cv_phrases"] = cv_phrases
+                st.session_state["essential_reqs"] = essential
+                st.session_state["desirable_reqs"] = desirable
+                st.session_state["ess_edit"] = "\n".join(essential)
+                st.session_state["des_edit"] = "\n".join(desirable)
+                st.session_state["last_extracted_jd"] = jd_text
+                st.session_state["last_extracted_cv"] = cv_text
                 _reset_scores_only()
-                st.success(
-                    f"✅ Found **{len(jd_phrases)}** phrase(s) in the JD and "
-                    f"**{len(cv_phrases)}** phrase(s) in your CV."
-                )
+                st.toast("✅ Skills extracted successfully!")
+                st.rerun()
 
-    # ── Show results if extraction was done ───────────────────────────────────
+    # ── Display extracted phrases if available ───────────────────────────────
     if st.session_state.get("jd_phrases") is not None:
-        jd_phrases = st.session_state["jd_phrases"]
-        cv_phrases = st.session_state["cv_phrases"]
+        jd_phrases = st.session_state.get("jd_phrases", [])
+        cv_phrases = st.session_state.get("cv_phrases", [])
 
-        col_j, col_c = st.columns(2)
+        col_j, col_c = st.columns(2, gap="large")
 
         with col_j:
-            st.markdown(f"**JD skills found ({len(jd_phrases)})**")
-            st.caption("These become the requirements in Step 3.")
+            st.markdown(f"**Found in JD ({len(jd_phrases)} phrases)**")
+            st.caption("These form the baseline requirements for Step 3.")
             if jd_phrases:
-                phrase_text = "  \n".join(f"• {p}" for p in jd_phrases)
-                st.markdown(phrase_text)
+                p_items = "  \n".join(f"• {p}" for p in jd_phrases)
+                st.markdown(p_items)
             else:
-                st.caption("None found.")
+                st.caption("No phrases found.")
 
         with col_c:
-            st.markdown(f"**Your CV skills found ({len(cv_phrases)})**")
-            st.caption("⚠️ These are *detected mentions* — not verified abilities.")
+            st.markdown(f"**Found in your CV ({len(cv_phrases)} phrases)**")
+            st.caption("⚠️ Detected mentions only — not verified proficiency.")
             if cv_phrases:
-                phrase_text = "  \n".join(f"• {p}" for p in cv_phrases)
-                st.markdown(phrase_text)
+                p_items = "  \n".join(f"• {p}" for p in cv_phrases)
+                st.markdown(p_items)
             else:
-                st.caption("None found.")
+                st.caption("No phrases found.")
 
-        st.success("✅ Extraction done! Scroll down to **Step 3** to review the requirements.")
+        st.success("✅ Extraction complete! Scroll down to **Step 3** to verify requirements.")
         return 3
 
     return 2
@@ -357,27 +433,33 @@ def render_step2(gliner_model) -> int:
 
 def render_step3() -> int:
     """
-    Let the user review and edit the Essential / Desirable requirement lists.
-    Returns 4 when the user is ready to score.
+    Review and edit Essential and Desirable requirement lists.
+    Guarantees state synchronization so requirements are never lost.
+    Returns 4 if requirements exist, else 3.
     """
-    st.markdown("### Step 3 — Check the Requirement List")
+    st.markdown("### Step 3 — Check & Edit Requirement List")
     st.markdown(
-        "The app sorted the JD phrases into two groups. "
-        "**Essential** requirements count double in the score. "
-        "**Desirable** requirements count once.\n\n"
-        "👇 Edit the boxes below — add anything that's missing, "
-        "delete anything wrong, one item per line."
+        "The requirements are organized into two tiers. "
+        "**Essential** requirements carry double weight (2×). "
+        "**Desirable** requirements carry single weight (1×).\n\n"
+        "👇 Feel free to add missing skills or delete incorrect lines (one item per line)."
     )
+
+    # Initialize edit states if missing
+    if "ess_edit" not in st.session_state:
+        st.session_state["ess_edit"] = "\n".join(st.session_state.get("essential_reqs", []))
+    if "des_edit" not in st.session_state:
+        st.session_state["des_edit"] = "\n".join(st.session_state.get("desirable_reqs", []))
 
     col_ess, col_des = st.columns(2, gap="large")
 
     # ── Essential ─────────────────────────────────────────────────────────────
     with col_ess:
-        st.markdown("#### 🔴 Essential  *(counts double)*")
-        st.caption("Must-have requirements. Add, remove, or correct lines.")
+        st.markdown("#### 🔴 Essential  *(Weight = 2)*")
+        st.caption("Must-have requirements. Edit or add lines below:")
         ess_text = st.text_area(
             "Essential requirements — one per line",
-            value="\n".join(st.session_state.get("essential_reqs", [])),
+            value=st.session_state.get("ess_edit", ""),
             height=220,
             key="ess_edit",
             label_visibility="collapsed",
@@ -386,15 +468,15 @@ def render_step3() -> int:
         if new_ess != st.session_state.get("essential_reqs", []):
             st.session_state["essential_reqs"] = new_ess
             _reset_scores_only()
-        st.caption(f"{len(new_ess)} item(s)")
+        st.caption(f"{len(new_ess)} essential requirement(s)")
 
     # ── Desirable ─────────────────────────────────────────────────────────────
     with col_des:
-        st.markdown("#### 🟡 Desirable  *(counts once)*")
-        st.caption("Nice-to-have requirements. Add, remove, or correct lines.")
+        st.markdown("#### 🟡 Desirable  *(Weight = 1)*")
+        st.caption("Nice-to-have requirements. Edit or add lines below:")
         des_text = st.text_area(
             "Desirable requirements — one per line",
-            value="\n".join(st.session_state.get("desirable_reqs", [])),
+            value=st.session_state.get("des_edit", ""),
             height=220,
             key="des_edit",
             label_visibility="collapsed",
@@ -403,25 +485,14 @@ def render_step3() -> int:
         if new_des != st.session_state.get("desirable_reqs", []):
             st.session_state["desirable_reqs"] = new_des
             _reset_scores_only()
-        st.caption(f"{len(new_des)} item(s)")
-
-    # ── Tips ──────────────────────────────────────────────────────────────────
-    with st.expander("💡 Tips for editing the lists"):
-        st.markdown(
-            """
-- **Add a missing skill:** type it on a new line in the right box.
-- **Remove something wrong:** delete that line.
-- **Change priority:** cut a line from one box and paste it into the other.
-- **Tip:** Essential = "must have" in the job ad. Desirable = "nice to have" or "advantage".
-            """
-        )
+        st.caption(f"{len(new_des)} desirable requirement(s)")
 
     total = len(st.session_state.get("essential_reqs", [])) + len(st.session_state.get("desirable_reqs", []))
     if total == 0:
-        st.warning("⚠️  Both lists are empty. Add at least one requirement to score against.")
+        st.warning("⚠️ Both requirement lists are empty. Please type at least one requirement to score against.")
         return 3
 
-    st.success(f"✅ {total} requirement(s) ready. Scroll down to **Step 4** to get your score.")
+    st.success(f"✅ {total} requirement(s) configured. Scroll down to **Step 4** to calculate your match score.")
     return 4
 
 
@@ -431,22 +502,21 @@ def render_step3() -> int:
 
 def render_step4(st_model, threshold: float) -> None:
     """
-    Score the CV against the requirements, then display results clearly.
+    Score the CV against the requirements, displaying results across the full width.
     """
-    st.markdown("### Step 4 — Get Your Match Score")
+    st.markdown("### Step 4 — Calculate Match Score & Recommendations")
     st.markdown(
-        "The app will compare each requirement from Step 3 against your CV text. "
-        "Click the button and wait about 10–30 seconds."
+        "Each requirement is matched against your CV text using both exact keyword matching "
+        "and Sentence-Transformers semantic similarity."
     )
 
-    # Stale-extraction warning
     if _text_changed_since_extraction():
         st.warning(
-            "⚠️  Your JD or CV text changed after the last extraction. "
-            "Go back to **Step 2** and click **Find Skill Phrases** again first."
+            "⚠️ Your JD or CV text changed after the last extraction. "
+            "For highest accuracy, re-run Step 2 to refresh the phrases."
         )
 
-    col_btn, col_note = st.columns([1, 3])
+    col_btn, col_note = st.columns([1, 4])
     with col_btn:
         score_clicked = st.button(
             "📊 Calculate My Score",
@@ -455,7 +525,7 @@ def render_step4(st_model, threshold: float) -> None:
             type="primary",
         )
     with col_note:
-        st.caption("Takes about 10–30 seconds.")
+        st.caption("Embeds and compares sentences using MiniLM. Takes about 5–20 seconds.")
 
     if score_clicked:
         essential = st.session_state.get("essential_reqs", [])
@@ -463,156 +533,167 @@ def render_step4(st_model, threshold: float) -> None:
         all_reqs = [(r, "essential") for r in essential] + [(r, "desirable") for r in desirable]
 
         if not all_reqs:
-            st.warning("No requirements to score. Go back to Step 3 and add some.")
+            st.error("⚠️ No requirements to score. Please add at least one requirement in Step 3.")
             return
 
-        jd_text = st.session_state.get("jd_text", "")
-        cv_text = st.session_state.get("cv_text", "")
+        jd_text = st.session_state.get("jd_text", "").strip()
+        cv_text = st.session_state.get("cv_text", "").strip()
 
-        with st.spinner("🤖 Scoring your CV… (checking each requirement)"):
-            score_rows = score_cv_against_requirements(
-                requirements=all_reqs,
-                cv_text=cv_text,
-                st_model=st_model,
-                threshold=threshold,
-            )
-            meaning_score = compute_meaning_similarity(jd_text, cv_text, st_model)
-            coverage_score, final_rating = compute_final_rating(score_rows, meaning_score)
+        if not cv_text:
+            st.error("⚠️ Your CV text is empty. Please paste or upload your CV in Step 1.")
+            return
 
-        st.session_state.update({
-            "score_rows": score_rows,
-            "coverage_score": coverage_score,
-            "meaning_score": meaning_score,
-            "final_rating": final_rating,
-        })
+        with st.spinner("🤖 Scoring your CV against requirements…"):
+            try:
+                score_rows = score_cv_against_requirements(
+                    requirements=all_reqs,
+                    cv_text=cv_text,
+                    st_model=st_model,
+                    threshold=threshold,
+                )
+                meaning_score = compute_meaning_similarity(jd_text, cv_text, st_model)
+                coverage_score, final_rating = compute_final_rating(score_rows, meaning_score)
 
-    # ── Display results ───────────────────────────────────────────────────────
+                st.session_state["score_rows"] = score_rows
+                st.session_state["coverage_score"] = coverage_score
+                st.session_state["meaning_score"] = meaning_score
+                st.session_state["final_rating"] = final_rating
+                st.toast("🎉 Score calculation complete!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Score calculation failed: {e}")
+                return
+
+    # ── Display results if calculated ─────────────────────────────────────────
     if st.session_state.get("final_rating") is None:
         return
 
-    fr  = st.session_state["final_rating"]
-    cov = st.session_state["coverage_score"]
-    msim= st.session_state["meaning_score"]
-    rows = st.session_state["score_rows"]
+    fr = float(st.session_state["final_rating"])
+    cov = float(st.session_state["coverage_score"])
+    msim = float(st.session_state["meaning_score"])
+    rows = st.session_state.get("score_rows", [])
 
     st.markdown("---")
 
-    # ── Score banner ──────────────────────────────────────────────────────────
-    st.markdown("#### 🎯 Your Match Score")
+    # ── Score Banner ──────────────────────────────────────────────────────────
+    st.markdown("#### 🎯 Overall Match Score")
 
-    if fr >= 75:
-        st.success(f"### {fr:.0f} / 100 — Strong Match 🟢")
-        st.markdown("Your CV mentions most of the job requirements using similar language.")
-    elif fr >= 50:
-        st.info(f"### {fr:.0f} / 100 — Moderate Match 🟡")
-        st.markdown("Your CV covers some requirements well, but a few gaps remain.")
-    else:
-        st.warning(f"### {fr:.0f} / 100 — Weak Match 🔴")
-        st.markdown("Your CV may be missing key requirement language from the job posting.")
+    col_score_card, col_metrics = st.columns([1, 2], gap="large")
 
-    st.progress(min(int(fr), 100))
+    with col_score_card:
+        if fr >= 75:
+            st.success(f"## {fr:.0f} / 100 — Strong Match 🟢")
+            st.markdown("Your CV mentions most of the job requirements with matching phrasing.")
+        elif fr >= 50:
+            st.info(f"## {fr:.0f} / 100 — Moderate Match 🟡")
+            st.markdown("Your CV covers some requirements well, but notable gaps exist.")
+        else:
+            st.warning(f"## {fr:.0f} / 100 — Weak Match 🔴")
+            st.markdown("Your CV is missing key requirement language from the job posting.")
 
-    # ── Score breakdown ────────────────────────────────────────────────────────
-    with st.expander("📐 How is the score calculated?", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Requirement Coverage", f"{cov:.0f} / 100",
-                    help="How many requirements your CV mentions (weighted by priority).")
-        col2.metric("Meaning Similarity", f"{msim*100:.0f} / 100",
-                    help="How similar the overall writing style and vocabulary is.")
-        col3.metric("Final Rating", f"{fr:.0f} / 100",
-                    help="70% coverage + 30% meaning similarity.")
-        st.markdown(
-            """
-**Formula:** `Final = 0.70 × Coverage + 0.30 × Meaning`
+        st.progress(min(max(int(fr), 0), 100))
 
-- **Coverage** checks whether each requirement phrase appears in your CV.
-- **Meaning** checks whether your CV and the JD use similar vocabulary overall.
-- Essential requirements count **twice** as much as desirable ones.
-
-> ⚠️ These weights are *prototype values* — not proven by research.
-> The score estimates **text alignment only**. It does not verify your skills,
-> qualifications, experience, or predict hiring success.
-            """
+    with col_metrics:
+        m_c1, m_c2, m_c3 = st.columns(3)
+        m_c1.metric(
+            "Requirement Coverage",
+            f"{cov:.0f}%",
+            help="Weighted score of how many JD requirements were found in your CV (Essential counts 2×).",
+        )
+        m_c2.metric(
+            "Meaning Similarity",
+            f"{msim * 100:.0f}%",
+            help="Semantic cosine similarity between overall JD and CV language windows.",
+        )
+        m_c3.metric(
+            "Combined Rating",
+            f"{fr:.0f} / 100",
+            help="70% Weighted Coverage + 30% Overall Meaning Similarity.",
         )
 
-    st.caption("⚠️ Reminder: this score measures text similarity, not actual competence.")
-    st.markdown("")
+        with st.expander("📐 How the score formula works", expanded=False):
+            st.markdown(
+                """
+**Formula:** `Final Score = 0.70 × Coverage + 0.30 × (Meaning Similarity × 100)`
 
-    # ── Requirement-by-requirement table ─────────────────────────────────────
+- **Coverage:** Evaluates each requirement phrase. Direct mention = 1.0 credit, semantic match = 0.5 credit, limitation detected = 0.0 credit.
+- **Meaning:** Measures vocabulary and context alignment across the full document text.
+- **Weights:** Essential items count **twice (2×)** as much as Desirable items.
+
+> ⚠️ **Disclaimer:** All weights are prototype design choices. Scores reflect **text similarity only**, not verified candidate competence or hiring probability.
+                """
+            )
+
+    st.markdown("---")
+
+    # ── Table breakdown ───────────────────────────────────────────────────────
     st.markdown("#### 📋 Requirement-by-Requirement Breakdown")
-    st.markdown(
-        "This table shows how each requirement was matched to your CV. "
-        "Click a row to read the supporting quote from your CV."
-    )
-
-    import pandas as pd
+    st.caption("Review how each requirement was matched against your CV text.")
 
     icon_map = {
-        "direct":   "✅ Found in CV",
-        "possible": "🔶 Possible — please check",
-        "limited":  "⚠️ Found, but limitation detected",
-        "missing":  "❌ Not found",
+        "direct": "✅ Found in CV",
+        "possible": "🔶 Possible (Verify)",
+        "limited": "⚠️ Limitation Detected",
+        "missing": "❌ Not Found",
     }
 
     rows_display = []
     for r in rows:
+        evidence = r.get("evidence", "") or "—"
+        if len(evidence) > 150:
+            evidence = evidence[:150] + "…"
         rows_display.append({
-            "Requirement":    r["requirement"],
-            "Priority":       "🔴 Essential" if r["priority"] == "essential" else "🟡 Desirable",
-            "Result":         icon_map.get(r["status"], r["status"]),
-            "Score":          f"{r['credit']:.1f}",
-            "CV Passage":     r.get("evidence", "—")[:120] + ("…" if len(r.get("evidence","")) > 120 else ""),
+            "Requirement": r.get("requirement", ""),
+            "Priority": "🔴 Essential" if r.get("priority") == "essential" else "🟡 Desirable",
+            "Status": icon_map.get(r.get("status", ""), r.get("status", "")),
+            "Credit": f"{float(r.get('credit', 0.0)):.1f}",
+            "CV Evidence Passage": evidence,
         })
 
     df = pd.DataFrame(rows_display)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     # ── Suggestions ────────────────────────────────────────────────────────────
-    st.markdown("#### 💡 What You Can Improve")
+    st.markdown("#### 💡 Actionable Improvement Suggestions")
     st.caption(
-        "Only act on suggestions that are **100% truthful** for you. "
-        "Never add skills or achievements you don't actually have."
+        "Only add experiences or keywords if they are **100% genuine and truthful**. "
+        "Never misrepresent skills."
     )
 
-    missing = [r for r in rows if r["status"] in ("missing", "limited")]
-    possible = [r for r in rows if r["status"] == "possible"]
+    missing = [r for r in rows if r.get("status") in ("missing", "limited")]
+    possible = [r for r in rows if r.get("status") == "possible"]
 
-    if not missing and not possible:
-        st.success(
-            "🎉 All requirements were directly matched in your CV! "
-            "Double-check the table above to make sure the matches are accurate."
-        )
-    else:
+    col_sugg1, col_sugg2 = st.columns(2, gap="large")
+
+    with col_sugg1:
+        st.markdown("**❌ Missing Requirements (Add if truthful)**")
         if missing:
-            st.markdown("**❌ These requirements were not found — add them if truthful:**")
             for r in missing:
-                priority_label = "essential" if r["priority"] == "essential" else "desirable"
-                with st.container():
-                    st.markdown(
-                        f"- **{r['requirement']}** *({priority_label})*\n"
-                        f"  → If you genuinely have this skill, add a specific example to your CV "
-                        f"(e.g. a project name, a tool version, a measurable result)."
-                    )
+                p_label = "Essential" if r.get("priority") == "essential" else "Desirable"
+                st.markdown(
+                    f"- **{r.get('requirement')}** *({p_label})*\n"
+                    f"  If you possess this skill, highlight a specific project, tool version, or outcome."
+                )
+        else:
+            st.success("🎉 No missing requirements detected!")
 
+    with col_sugg2:
+        st.markdown("**🔶 Possible Semantic Matches (Make more explicit)**")
         if possible:
-            st.markdown("**🔶 These may be covered — please verify:**")
             for r in possible:
                 ev = r.get("evidence", "")
-                with st.container():
-                    st.markdown(
-                        f"- **{r['requirement']}** *(possible match)*\n"
-                        f"  → Your CV says: *\"{ev[:150]}\"*\n"
-                        f"  → If this genuinely covers the requirement, "
-                        f"make the connection more explicit."
-                    )
+                st.markdown(
+                    f"- **{r.get('requirement')}**\n"
+                    f"  CV excerpt: *\"{ev[:120]}…\"*\n"
+                    f"  Consider using the job posting's exact terminology if appropriate."
+                )
+        else:
+            st.info("No borderline matches requiring verification.")
 
-    # ── Download ───────────────────────────────────────────────────────────────
-    st.markdown("#### 📥 Download Your Report")
-    st.markdown(
-        "Save a plain-text version of all these results to review offline "
-        "or share with a careers advisor."
-    )
+    st.markdown("---")
 
+    # ── Download Report ───────────────────────────────────────────────────────
+    st.markdown("#### 📥 Export Match Report")
     report_text = build_text_report(
         jd_text=st.session_state.get("jd_text", ""),
         cv_text=st.session_state.get("cv_text", ""),
@@ -622,8 +703,9 @@ def render_step4(st_model, threshold: float) -> None:
         final_rating=fr,
         threshold=threshold,
     )
+
     st.download_button(
-        label="⬇️ Download Report (.txt)",
+        label="⬇️ Download Full Report (.txt)",
         data=report_text.encode("utf-8"),
         file_name=f"cv_match_report_{datetime.date.today()}.txt",
         mime="text/plain",
@@ -632,107 +714,96 @@ def render_step4(st_model, threshold: float) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Sidebar — advanced settings + help
+# Sidebar — Settings & Help
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_sidebar() -> float:
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("⚙️ Configuration")
         threshold = st.slider(
-            "Similarity sensitivity",
+            "Semantic match threshold",
             min_value=0.40,
             max_value=0.95,
             value=0.60,
             step=0.05,
-            help=(
-                "How similar a CV sentence needs to be to count as a 'possible match'. "
-                "Lower = more lenient (more possible matches, more false positives). "
-                "Higher = stricter (fewer matches, fewer false positives)."
-            ),
+            help="Cosine similarity threshold for semantic matches (Sentence-Transformers). Higher = stricter.",
         )
-        st.caption(f"Current: {threshold:.2f}")
+        st.caption(f"Sensitivity: {threshold:.2f}")
 
         st.markdown("---")
-        st.markdown("**❓ Quick Help**")
-        with st.expander("What do the scores mean?"):
+        st.markdown("**❓ Quick Help & FAQs**")
+        with st.expander("Score interpretations"):
             st.markdown(
                 """
-| Score | Meaning |
-|-------|---------|
-| 75–100 | Strong text match |
-| 50–74 | Moderate match |
-| 0–49 | Weak match |
+- **75–100:** Strong alignment with JD terminology
+- **50–74:** Moderate match, some missing requirements
+- **0–49:** Low alignment with JD requirements
 
-The score measures **text similarity only**.
-It does NOT verify your actual skills.
+*Scores measure text similarity only — not verified candidate ability.*
                 """
             )
-        with st.expander("What are ✅ / 🔶 / ❌?"):
+        with st.expander("Status icons"):
             st.markdown(
                 """
-- ✅ **Found** — that exact phrase appears in your CV
-- 🔶 **Possible** — a similar phrase was found (AI matched it — you should verify)
-- ⚠️ **Limited** — phrase found but near words like "no experience"
-- ❌ **Missing** — not found at all
+- ✅ **Found** — exact keyword phrase found in CV
+- 🔶 **Possible** — semantic match found via embeddings (verify manually)
+- ⚠️ **Limited** — phrase found near negative phrasing ("no experience")
+- ❌ **Not Found** — phrase not identified in CV
                 """
             )
-        with st.expander("My PDF shows no text?"):
+        with st.expander("Data privacy"):
             st.markdown(
-                "Your PDF is probably **scanned** (a photo of paper). "
-                "This app can't read images — only text-based PDFs. "
-                "Try exporting your CV as a text PDF, or paste the text manually."
-            )
-        with st.expander("Privacy"):
-            st.markdown(
-                "Your CV and JD text is processed **in memory only** during your session. "
-                "Nothing is saved to a database or sent to any third-party service."
+                "All text and files are processed **strictly in-memory** during your session. "
+                "No database, storage, or external logging is used."
             )
 
         st.markdown("---")
-        if st.button("🔄 Start Over", key="btn_reset"):
+        if st.button("🔄 Reset App & Start Over", key="btn_reset_all", use_container_width=True):
             _reset_all()
             st.rerun()
 
-        st.caption("Models: GLiNER small-v2.1 · all-MiniLM-L6-v2")
+        st.caption("AI Models: GLiNER small-v2.1 · all-MiniLM-L6-v2")
     return threshold
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main app
+# Main application entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     # ── Header ────────────────────────────────────────────────────────────────
-    st.title("📄 CV–Job Match")
+    st.title("📄 CV–Job Match Analysis")
     st.markdown(
-        "**Find out how well your CV matches a job description** — "
-        "using AI, in 4 simple steps. No sign-up, no paid API, nothing stored."
+        "**Evaluate how well your CV aligns with any Job Description** — "
+        "powered by open-source Hugging Face models (**GLiNER** & **Sentence-Transformers**)."
     )
     st.caption(
-        "⚠️ This tool measures *text similarity* only — not your actual skills, "
-        "qualifications, or hiring chances. Treat the score as a reflection tool."
+        "⚠️ *Ethical AI Notice:* This system estimates text alignment and vocabulary coverage. "
+        "It does not assess human competence, experience quality, or predict hiring decisions."
     )
     st.markdown("---")
 
-    # ── Settings (sidebar) ─────────────────────────────────────────────────────
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     threshold = render_sidebar()
 
-    # ── Load models (once per session) ────────────────────────────────────────
-    with st.spinner("⏳ Loading AI models — first run downloads ~140 MB, please wait…"):
+    # ── Load pretrained models ────────────────────────────────────────────────
+    with st.spinner("⏳ Loading AI models (GLiNER & Sentence-Transformers)…"):
         gliner_model = load_gliner()
-        st_model     = load_sentence_transformer()
+        st_model = load_sentence_transformer()
 
     if gliner_model is None or st_model is None:
         st.error(
-            "❌ Could not load the AI models. "
-            "Check your internet connection — the models are downloaded from "
-            "Hugging Face Hub on first run. See README.md for troubleshooting."
+            "❌ AI models could not be loaded. Please verify your internet connection "
+            "so weights can download from Hugging Face Hub."
         )
         st.stop()
 
-    # ── Determine which step the user is on ───────────────────────────────────
-    # We figure out the furthest completed step to show the progress bar correctly.
-    if st.session_state.get("jd_phrases") is not None and st.session_state.get("essential_reqs") is not None:
+    # ── Determine active wizard step ───────────────────────────────────────────
+    if st.session_state.get("final_rating") is not None:
+        progress_step = 4
+    elif st.session_state.get("jd_phrases") is not None and (
+        st.session_state.get("essential_reqs") or st.session_state.get("desirable_reqs")
+    ):
         progress_step = 3
     elif st.session_state.get("jd_text", "").strip() and st.session_state.get("cv_text", "").strip():
         progress_step = 2
@@ -741,32 +812,32 @@ def main() -> None:
 
     _render_progress(progress_step)
 
-    # ══ STEP 1 ════════════════════════════════════════════════════════════════
+    # ══ STEP 1: Add Documents ═════════════════════════════════════════════════
     step1_result = render_step1()
     if step1_result < 2:
-        return  # Nothing more to show until both documents are added
+        return
 
-    # ══ STEP 2 ════════════════════════════════════════════════════════════════
+    # ══ STEP 2: Find Skills ═══════════════════════════════════════════════════
     st.markdown("---")
     step2_result = render_step2(gliner_model)
     if step2_result < 3:
-        return  # Extraction not done yet
+        return
 
-    # ══ STEP 3 ════════════════════════════════════════════════════════════════
+    # ══ STEP 3: Review Requirements ═══════════════════════════════════════════
     st.markdown("---")
     step3_result = render_step3()
     if step3_result < 4:
-        return  # No requirements yet
+        return
 
-    # ══ STEP 4 ════════════════════════════════════════════════════════════════
+    # ══ STEP 4: Calculate Score ═══════════════════════════════════════════════
     st.markdown("---")
     render_step4(st_model, threshold)
 
-    # ── Footer ─────────────────────────────────────────────────────────────────
+    # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("---")
     st.caption(
-        "CV–Job Match · prototype · GLiNER small-v2.1 · all-MiniLM-L6-v2 · "
-        "no data stored · not a hiring tool"
+        "CV–Job Match · GLiNER small-v2.1 · all-MiniLM-L6-v2 · "
+        "Strictly In-Memory · Designed for Streamlit Cloud"
     )
 
 
